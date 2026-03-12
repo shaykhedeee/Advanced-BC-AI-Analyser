@@ -32,11 +32,24 @@ _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _parent not in sys.path:
     sys.path.insert(0, _parent)
 
+# Multi-model LLM ensemble (semantic cluster + weighted voting)
+try:
+    from encryptor_pro.crypt0_deployment import MultiAIOrchestrator as _MultiAIOrchestrator
+    from encryptor_pro.crypt0_deployment import ModelSelection as _ModelSelection
+    MultiAIOrchestrator = _MultiAIOrchestrator  # always defined below this point
+    ModelSelection = _ModelSelection
+    _ORCHESTRATOR_AVAILABLE = True
+except ImportError:
+    MultiAIOrchestrator = None  # type: ignore[assignment,misc]
+    ModelSelection = None  # type: ignore[assignment,misc]
+    _ORCHESTRATOR_AVAILABLE = False
+
 # Pattern Solver integration
 try:
-    from pattern_solver import get_solver
+    from pattern_solver import get_solver as _get_solver
     _SOLVER_AVAILABLE = True
 except ImportError:
+    _get_solver = None  # type: ignore[assignment]
     _SOLVER_AVAILABLE = False
 
 
@@ -67,6 +80,7 @@ class AIBrain:
         self.is_initialized = False
         self._lock = threading.Lock()
         self.solver = None
+        self.orchestrator: Optional[Any] = None
 
         # Auto-weight adjustment
         self._source_scores = {k: deque(maxlen=100) for k in self.weights}
@@ -79,9 +93,9 @@ class AIBrain:
         print("[AI Brain] Initializing master AI controller ...")
 
         # 0. Pattern Solver (master engine)
-        if _SOLVER_AVAILABLE:
+        if _SOLVER_AVAILABLE and _get_solver is not None:
             try:
-                self.solver = get_solver()
+                self.solver = _get_solver()
                 self.sources["pattern_solver"] = self.solver
                 print("[AI Brain]  + Pattern Solver loaded")
             except Exception as e:
@@ -148,6 +162,23 @@ class AIBrain:
         except Exception as e:
             print(f"[AI Brain]  - Vision Analyzer unavailable: {e}")
 
+        # 7. Multi-AI Orchestrator (semantic cluster + weighted vote for strategy)
+        if _ORCHESTRATOR_AVAILABLE and MultiAIOrchestrator is not None:
+            try:
+                orch_config = {
+                    "ollama_base_url": self.config.get("ollama_base_url", "http://localhost:11434"),
+                    "semantic_similarity_threshold": self.config.get("semantic_similarity_threshold", 0.70),
+                    "max_analysis_models": self.config.get("max_analysis_models", 0),
+                }
+                self.orchestrator = MultiAIOrchestrator(orch_config)
+                local_models = self.orchestrator.discover_local_models()
+                if local_models:
+                    print(f"[AI Brain]  + MultiAI Orchestrator ready ({len(local_models)} models: {', '.join(local_models)})")
+                else:
+                    print("[AI Brain]  ~ MultiAI Orchestrator loaded (no local models discovered — Ollama may be offline)")
+            except Exception as e:
+                print(f"[AI Brain]  - MultiAI Orchestrator unavailable: {e}")
+
         active = len([k for k in self.sources if k != "security"])
         print(f"[AI Brain] Ready — {active} prediction sources active")
         self.is_initialized = True
@@ -168,7 +199,7 @@ class AIBrain:
         # 0. Pattern Solver verdict
         if self.solver is not None and len(game_data) >= 20:
             try:
-                solver_result = self.solver.analyze(game_data)
+                solver_result = self.solver.analyze(game_data)  # type: ignore[call-arg]
                 action = solver_result.get('action', 'WAIT')
                 # Convert action to numeric score: BET=high, WAIT=mid, REDUCE/EXIT=low
                 action_scores = {'BET': 0.75, 'WAIT': 0.50, 'REDUCE': 0.30, 'EXIT': 0.10}
@@ -221,15 +252,25 @@ class AIBrain:
             except Exception as e:
                 details["ai_predictor_error"] = str(e)
 
-        # 4. LLM strategy hint (qualitative, not numeric)
-        if "llm_assistant" in self.sources:
+        # 4. LLM strategy consensus (multi-model semantic-vote if orchestrator present)
+        recent_str = ", ".join([f"{v:.2f}" for v in game_data[-15:]])
+        strategy_prompt = (
+            f"Last 15 {game_type} crash results: [{recent_str}]. "
+            f"Average: {np.mean(game_data[-15:]):.2f}. "
+            f"Should I bet next round? Reply in one sentence."
+        )
+        if self.orchestrator is not None and ModelSelection is not None:
+            try:
+                consensus = self.get_strategy_consensus(strategy_prompt)
+                if consensus["text"]:
+                    details["llm_hint"] = consensus["text"]
+                    details["llm_consensus"] = consensus
+            except Exception as e:
+                details["llm_hint_error"] = str(e)
+        elif "llm_assistant" in self.sources:
             try:
                 llm = self.sources["llm_assistant"]
-                recent_str = ", ".join([f"{v:.2f}" for v in game_data[-15:]])
-                hint = llm.analyze_game_data(
-                    f"Last 15 {game_type} results: [{recent_str}]. "
-                    f"Average: {np.mean(game_data[-15:]):.2f}"
-                )
+                hint = llm.analyze_game_data(strategy_prompt)
                 details["llm_hint"] = hint
             except Exception:
                 pass
@@ -319,7 +360,7 @@ class AIBrain:
             return 1.0
         recent = list(scores)[-20:]
         accuracy = np.mean(recent)
-        return 0.5 + accuracy  # Range: 0.5 to 1.5
+        return float(0.5 + accuracy)  # Range: 0.5 to 1.5
 
     # ------------------------------------------------------------------
     # Feedback / Learning
@@ -343,6 +384,51 @@ class AIBrain:
             "actual": actual_value,
             "error": relative_error,
         })
+
+    # ------------------------------------------------------------------
+    # Multi-LLM Strategy Consensus
+    # ------------------------------------------------------------------
+    def get_strategy_consensus(self, prompt: str, system: str = "") -> Dict[str, Any]:
+        """
+        Poll all discovered local Ollama models with a strategy prompt and
+        return semantic-cluster weighted-vote consensus.
+        """
+        if ModelSelection is None or self.orchestrator is None:
+            return {"text": "", "winning_models": [], "vote_weights": {}, "raw": {}}
+
+        local_models = self.orchestrator.discover_local_models()
+        if not local_models:
+            # Fallback: try single llm_assistant if available
+            if "llm_assistant" in self.sources:
+                try:
+                    text = self.sources["llm_assistant"].analyze_game_data(prompt)
+                    return {"text": text, "winning_models": ["llm_assistant"], "vote_weights": {}, "raw": {}}
+                except Exception:
+                    pass
+            return {"text": "", "winning_models": [], "vote_weights": {}, "raw": {}}
+
+        selection = ModelSelection(
+            model=local_models[0],
+            source="ollama-local",
+            reasoning="BC game strategy consensus",
+            analysis_models=local_models,
+        )
+
+        result = self.orchestrator.run_ensemble(
+            prompt=prompt,
+            selection=selection,
+            system=system or (
+                "You are a concise BC crash game betting assistant. "
+                "Give practical one-sentence advice."
+            ),
+        )
+
+        return {
+            "text": result.consensus_text,
+            "winning_models": result.winning_models,
+            "vote_weights": result.vote_weights,
+            "raw": result.raw_outputs,
+        }
 
     def train_transformer(self, game_data: list, epochs: int = 50):
         """Train (or retrain) the tiny transformer on new game data."""
